@@ -1,170 +1,156 @@
 # Warehouse Reservation System (Laravel)
 
 ## Overview
-This project implements a **simplified event-driven warehouse reservation system** using Laravel.  
-The system handles the following workflows:
-- Order creation
-- Inventory reservation
-- Supplier integration
-- Delayed delivery confirmation via asynchronous jobs
+Цей проект реалізує **спрощену подієво-орієнтовану систему резервування складу** за допомогою Laravel.  
+Система обробляє такі робочі процеси:
+- Створення замовлення
+- Резервування інвентарю
+- Інтеграцію з постачальником
+- Підтвердження затримки доставки через асинхронні завдання
 
-### Core Principles
-- **Event-driven architecture**
-- **Asynchronous processing**
-- **Idempotent and retry-safe jobs**
-- **Clear order state machine**
+### Основні принципи
+- **Подієво-орієнтована архітектура**
+- **Асинхронна обробка**
+- **Завдання, що підтримують ідемпотентність і повторюваність**
+- **Прозорий стан замовлення**
 
 ---
 
-## Event Flow Description
+## Опис потоку подій
 
-### 1. Order Creation
+### 1. Створення замовлення
 - **Endpoint:**
   ```
   POST /api/order
   ```
 
-- **Flow:**
-    1. Client submits `sku` and `qty`.
-    2. The system creates an **Order** with status `pending`.
-    3. The `OrderCreated` event is emitted.
-    4. Event listener dispatches the `ReserveInventoryJob`.
+- **Потік:**
+    1. Клієнт надсилає `sku` та `qty`.
+    2. Система створює **Order** зі статусом `pending`.
+    3. Емітується подія `OrderCreated`.
+    4. Слухач події запускає завдання `ReserveInventoryJob`.
 
 ---
 
-### 2. Inventory Reservation (Async Job)
-- **Job:** `ReserveInventoryJob`
+### 2. Резервування інвентарю (Асинхронне завдання)
+- **Завдання:** `ReserveInventoryJob`
 
-- **Flow:**
-    - Job runs inside a DB transaction:
-        1. The inventory row is locked using `SELECT ... FOR UPDATE`.
-        2. **If stock is sufficient:**
-            - Inventory quantity is decremented.
-            - Inventory movement record is created.
-            - Order status → `reserved`.
-        3. **If stock is insufficient:**
-            - A supplier reserve request is sent.
-            - Order status → `awaiting_restock`.
-            - Supplier reference is stored.
-            - `CheckSupplierStatusJob` is scheduled with a **15s delay**.
+- **Потік:**
+    - Завдання виконується в рамках транзакції БД:
+        1. Рядок інвентарю блокується через `SELECT ... FOR UPDATE`.
+        2. **Якщо запасів достатньо:**
+            - Кількість інвентарю зменшується.
+            - Створюється запис про рух інвентарю.
+            - Статус замовлення → `reserved`.
+        3. **Якщо запасів недостатньо:**
+            - Відправляється запит резервування до постачальника.
+            - Статус замовлення → `awaiting_restock`.
+            - Зберігається посилання на постачальника.
+            - Завдання `CheckSupplierStatusJob` переноситься на **15 секунд**.
 
 ---
 
-### 3. Supplier Integration
-- **Reserve Endpoint:**
+### 3. Інтеграція з постачальником
+- **Endpoint резервування:**
   ```
   POST /supplier/reserve
   ```
 
-- **Response Example:**
+- **Приклад відповіді:**
   ```json
   { "accepted": true, "ref": "1234" }
   ```
 
-- Notes:
-    - `accepted = true` does **NOT** guarantee actual delivery.
-    - Integration is mocked using `Http::fake()` for testability and isolation.
+- **Примітки:**
+    - `accepted = true` не гарантує фактичної доставки.
+    - Інтеграція емулюється за допомогою `Http::fake()` для тестування й ізоляції.
 
 ---
 
-### 4. Supplier Status Check (Delayed Job)
-- **Job:** `CheckSupplierStatusJob`
+### 4. Перевірка статусу постачальника (Відкладене завдання)
+- **Завдання:** `CheckSupplierStatusJob`
 
-- **Flow:**  
-  Job checks the supplier status by reference:
-    - Possible responses:
-        - `ok` → Order status → `reserved`
-        - `fail` → Order status → `failed`
-        - `delayed` → Retry after **15 seconds**
+- **Потік:**  
+  Завдання перевіряє статус постачальника за посиланням:
+    - Можливі відповіді:
+        - `ok` → Статус замовлення → `reserved`
+        - `fail` → Статус замовлення → `failed`
+        - `delayed` → Повторна перевірка через **15 секунд**
 
-    - **Maximum Retries for `delayed`:** 2  
-      After 2 retries → Order status → `failed`.
+    - **Максимум повторів для `delayed`:** 2  
+      Після 2 спроб → Статус замовлення → `failed`.
 
 ---
 
-### 5. Read Endpoints
-- **Get order details and status:**
+### 5. Endpoint'и для читання
+- **Деталі замовлення та його статус:**
   ```
   GET /api/orders/{id}
   ```
 
-- **Get inventory movement history:**
+- **Історія руху інвентарю:**
   ```
   GET /api/inventory/{sku}/movements
   ```
 
 ---
 
-## Error Handling Strategy
+## Стратегія обробки помилок
 
-### 1. Asynchronous Error Isolation
-- Heavy business logic is executed in **queued jobs**.
-- Failures do **not** block HTTP requests.
-- Queue retry mechanism is used for transient failures.
+### 1. Ізоляція асинхронних помилок
+- Складна бізнес-логіка виконується в **завданнях черги**.
+- Помилки **не** блокують HTTP-запити.
+- Для обробки тимчасових збоїв використовується механізм повторів у черзі.
 
-### 2. Database Consistency
-- Inventory reservation is wrapped in a **DB transaction**.
-- Row-level locking (`lockForUpdate`) prevents race conditions.
-- Inventory movements are written atomically with stock changes.
+### 2. Консистентність бази даних
+- Резервування інвентарю виконується в рамках транзакції БД.
+- Для уникнення змагання використовується блокування рядків (`lockForUpdate`).
+- Рухи інвентарю записуються атомарно зі зміною запасу.
 
-### 3. External Service Failures
-- Supplier integration is treated as **eventually consistent**.
-- No assumption is made that `accepted = true` guarantees delivery.
-- Delayed responses are retried with **backoff (15s delay)**.
-- Hard stop after max retry count to avoid infinite loops.
+### 3. Збої зовнішніх сервісів
+- Інтеграція з постачальником обробляється як **зрештою консистентна**.
+- Немає припущення, що `accepted = true` гарантує доставку.
+- Затримані відповіді повторюються із **затримкою в 15 секунд**.
+- Жорстка зупинка після досягнення максимального числа повторів.
 
-### 4. Idempotency
-- Order status transitions are controlled explicitly.
-- Jobs can be retried safely without duplicating inventory movements.
-- State-based logic prevents double reservation.
-
----
-
-## Production Improvements
-
-For a production-ready environment, the following improvements would be implemented:
-
-### 1. State Machine / Domain Layer
-- Introduce an explicit **Order State Machine**.
-- Enforce valid state transitions only.
-- Move business logic out of Jobs into **domain services**.
-
-### 2. Observability
-- Add **structured logging** for each state transition.
-- Implement **distributed tracing** for async flows.
-- Track metrics for:
-    - Reservation success rate
-    - Supplier delays
-    - Job retry counts
-
-### 3. Reliability & Scalability
-- Use **Redis queue driver**.
-- Add **dead-letter queues** for failed jobs.
-- Implement **exponential backoff** instead of a fixed delay.
-- Add **idempotency keys** for external integrations.
-
-### 4. Data Integrity
-- Add **database constraints** for order state transitions.
-- Introduce **inventory versioning**.
-- Add **optimistic locking** for inventory rows.
-
-### 5. Testing
-- Feature tests for the full order lifecycle.
-- Contract tests for supplier integration.
-- Load tests for concurrent reservations.
-
-### 6. Security & API Hardening
-- Rate limiting on order creation.
-- **Authentication** & **authorization**.
-- Input validation and **SKU normalization**.
+### 4. Ідемпотентність
+- Перехід статусу замовлення контролюється явно.
+- Завдання можна повторювати без дублювання рухів інвентарю.
+- Логіка переходу стану запобігає подвійному резервуванню.
 
 ---
 
-## Summary
-This project demonstrates:
-- **Event-driven Laravel architecture**
-- **Asynchronous workflow design**
-- **Safe inventory reservation under concurrency**
-- **Real-world handling of unreliable external systems**
+## Покращення для продакшн-оточення
 
-The implementation prioritizes **correctness**, **clarity**, and **extensibility** over premature optimization.
+### 1. Архітектура та доменний шар
+- Впровадити прозору **State Machine** для управління статусами замовлень.
+- Винести бізнес-логіку з завдань у **доменні сервіси**.
+
+### 2. Масштабування та надійність
+- Використовувати **Redis queue driver**.
+- Додати **dead-letter queue** для невдалих завдань.
+- Застосувати **експоненційне збільшення затримки** замість фіксованої.
+
+### 3. Спостережуваність
+- Додати **структуровані логи** для кожного переходу стану.
+- Використовувати **distributed tracing** для асинхронних потоків.
+- Відстежувати метрики:
+    - Відсоток успіху резервувань
+    - Затримки постачальника
+    - Кількість повторів завдань
+
+### 4. Безпека та надійність APIs
+- Лімітування швидкості запитів для створення замовлення.
+- Додати **аутентифікацію** та **авторизацію**.
+- Валідувати SKU через довідник.
+
+---
+
+## Резюме
+Цей проект демонструє:
+- **Архітектуру Laravel на основі подій**
+- **Дизайн асинхронного робочого процесу**
+- **Безпечне резервування інвентарю при конкуренції**
+- **Роботу з ненадійними зовнішніми системами**
+
+Поточна реалізація вже фокусується на коректності та розширюваності, а запропоновані покращення забезпечать стабільність під реальним навантаженням.
